@@ -20,6 +20,8 @@ import {
   formatDuration,
   sumVolume,
   sumReps,
+  loadMovementsCache,
+  suggestTodayFocus,
 } from './lib/tonal.js';
 
 import {
@@ -379,6 +381,39 @@ program
 
 // ─── fitdash digest ──────────────────────────────────────────────────────────
 
+// ─── fitdash suggest ────────────────────────────────────────────────────────
+
+program
+  .command('suggest')
+  .description("Suggest today's workout focus based on recent muscle groups hit")
+  .option('--telegram', 'Output Telegram MarkdownV2-safe')
+  .action((opts) => {
+    const tonalData = loadTonalWorkouts();
+    const whoopSummary = loadWhoopSummary();
+    const movementsMap = loadMovementsCache();
+    const recovery = whoopSummary ? getRecoveryInfo(whoopSummary) : { score: null };
+
+    const { suggestion, yesterday, rationale } = suggestTodayFocus(
+      tonalData,
+      movementsMap,
+      recovery.score
+    );
+
+    const yLine = yesterday.length > 0
+      ? 'Yesterday: ' + yesterday.slice(0, 3).join(', ')
+      : 'No recent workout data';
+
+    if (opts.telegram) {
+      console.log(`💪 *Today's Focus:* ` + escapeMdV2(suggestion));
+      console.log('  ' + escapeMdV2(yLine) + ' → ' + escapeMdV2(rationale));
+    } else {
+      console.log(chalk.bold.cyan('\n💪 Workout Suggestion\n'));
+      console.log(chalk.bold(`  Today's Focus: `) + chalk.green(suggestion));
+      console.log(chalk.dim('  ' + yLine + ' → ' + rationale));
+      console.log();
+    }
+  });
+
 program
   .command('digest')
   .description('One-liner for morning digest')
@@ -409,6 +444,12 @@ program
     const scores = tonalData ? getCurrentStrengthScores(tonalData) : null;
     const strengthStr = scores ? `strength ${scores.overall}` : '';
 
+    // Workout suggestion (muscle group awareness)
+    const movementsMap = loadMovementsCache();
+    const { suggestion, yesterday } = suggestTodayFocus(tonalData, movementsMap, recovery.score);
+    const yLine = yesterday.length > 0 ? `yesterday: ${yesterday.slice(0, 2).join(' + ')}` : '';
+    const suggestStr = `today: ${suggestion}${yLine ? ` (${yLine})` : ''}`;
+
     let parts = [];
     if (totalWorkouts > 0) {
       parts.push(`${totalWorkouts} workout${totalWorkouts > 1 ? 's' : ''} today`);
@@ -424,6 +465,7 @@ program
     parts.push(recStr);
     if (strengthStr) parts.push(strengthStr);
     parts.push(streakStr);
+    parts.push(suggestStr);
 
     const line = `fitdash: ${parts.join(', ')}`;
 
