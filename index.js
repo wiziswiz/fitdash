@@ -22,6 +22,11 @@ import {
   sumReps,
   loadMovementsCache,
   suggestTodayFocus,
+  loadMuscleReadiness,
+  loadStrengthDistribution,
+  loadStrengthCurrent,
+  loadExternalActivities,
+  suggestFromReadiness,
 } from './lib/tonal.js';
 
 import {
@@ -385,31 +390,124 @@ program
 
 program
   .command('suggest')
-  .description("Suggest today's workout focus based on recent muscle groups hit")
+  .description("Suggest today's workout focus using muscle readiness + WHOOP recovery")
   .option('--telegram', 'Output Telegram MarkdownV2-safe')
+  .option('--heuristic', 'Force heuristic mode (ignore muscle readiness data)')
   .action((opts) => {
-    const tonalData = loadTonalWorkouts();
     const whoopSummary = loadWhoopSummary();
-    const movementsMap = loadMovementsCache();
     const recovery = whoopSummary ? getRecoveryInfo(whoopSummary) : { score: null };
 
-    const { suggestion, yesterday, rationale } = suggestTodayFocus(
-      tonalData,
-      movementsMap,
-      recovery.score
-    );
+    // Try real muscle readiness first (from Tonal API)
+    const readiness = opts.heuristic ? null : loadMuscleReadiness();
+    const readinessSuggestion = suggestFromReadiness(readiness, recovery.score);
 
-    const yLine = yesterday.length > 0
-      ? 'Yesterday: ' + yesterday.slice(0, 3).join(', ')
-      : 'No recent workout data';
+    if (readinessSuggestion) {
+      // ─── Real muscle readiness mode ───
+      const { suggestion, muscles, avoid, rationale } = readinessSuggestion;
+
+      if (opts.telegram) {
+        console.log(`💪 *Today's Focus:* ` + escapeMdV2(suggestion));
+        if (muscles && muscles.length > 0) {
+          console.log(`  Ready: ` + escapeMdV2(muscles.slice(0, 4).join(', ')));
+        }
+        if (avoid && avoid.length > 0) {
+          console.log(`  ⚠️ Avoid: ` + escapeMdV2(avoid.slice(0, 3).join(', ')));
+        }
+        console.log('  ' + escapeMdV2(rationale));
+      } else {
+        console.log(chalk.bold.cyan('\n💪 Workout Suggestion (Muscle Readiness)\n'));
+        console.log(chalk.bold(`  Today's Focus: `) + chalk.green(suggestion));
+        if (muscles && muscles.length > 0) {
+          console.log(chalk.dim('  Ready: ') + muscles.slice(0, 4).join(', '));
+        }
+        if (avoid && avoid.length > 0) {
+          console.log(chalk.dim('  ⚠️  Avoid: ') + chalk.red(avoid.slice(0, 3).join(', ')));
+        }
+        console.log(chalk.dim('  ' + rationale));
+        console.log();
+      }
+    } else {
+      // ─── Heuristic fallback (no readiness data) ───
+      const tonalData = loadTonalWorkouts();
+      const movementsMap = loadMovementsCache();
+      const { suggestion, yesterday, rationale } = suggestTodayFocus(
+        tonalData, movementsMap, recovery.score
+      );
+      const yLine = yesterday.length > 0
+        ? 'Yesterday: ' + yesterday.slice(0, 3).join(', ')
+        : 'No recent workout data';
+
+      if (opts.telegram) {
+        console.log(`💪 *Today's Focus:* ` + escapeMdV2(suggestion));
+        console.log('  ' + escapeMdV2(yLine) + ' → ' + escapeMdV2(rationale));
+      } else {
+        console.log(chalk.bold.cyan('\n💪 Workout Suggestion (heuristic)\n'));
+        console.log(chalk.bold(`  Today's Focus: `) + chalk.green(suggestion));
+        console.log(chalk.dim('  ' + yLine + ' → ' + rationale));
+        console.log();
+      }
+    }
+  });
+
+// ─── fitdash readiness ───────────────────────────────────────────────────────────────
+
+program
+  .command('readiness')
+  .description('Show per-muscle readiness heatmap from Tonal')
+  .option('--telegram', 'Output Telegram MarkdownV2-safe')
+  .action((opts) => {
+    const readiness = loadMuscleReadiness();
+    const distribution = loadStrengthDistribution();
+    const whoopSummary = loadWhoopSummary();
+    const recovery = whoopSummary ? getRecoveryInfo(whoopSummary) : { score: null };
+
+    if (!readiness) {
+      console.error('No muscle readiness data. Run tonal-sync.sh first.');
+      process.exit(1);
+    }
+
+    // Sort by readiness score
+    const sorted = Object.entries(readiness)
+      .map(([muscle, score]) => ({ muscle, score }))
+      .sort((a, b) => b.score - a.score);
+
+    const bar = (score) => {
+      const filled = Math.round(score / 10);
+      return '█'.repeat(filled) + '░'.repeat(10 - filled);
+    };
+
+    const indicator = (score) => {
+      if (score >= 80) return '🟢';
+      if (score >= 50) return '🟡';
+      return '🔴';
+    };
 
     if (opts.telegram) {
-      console.log(`💪 *Today's Focus:* ` + escapeMdV2(suggestion));
-      console.log('  ' + escapeMdV2(yLine) + ' → ' + escapeMdV2(rationale));
+      console.log('*🎯 Muscle Readiness*');
+      if (recovery.score !== null) {
+        console.log(`WHOOP Recovery: ${recovery.score}%`);
+      }
+      console.log('');
+      for (const { muscle, score } of sorted) {
+        console.log(`${indicator(score)} ${escapeMdV2(muscle)}: ${score}%`);
+      }
+      if (distribution) {
+        console.log('');
+        console.log(`Strength: ${distribution.overallScore} \\(${escapeMdV2(distribution.percentile + 'th percentile')}\\)`);
+      }
     } else {
-      console.log(chalk.bold.cyan('\n💪 Workout Suggestion\n'));
-      console.log(chalk.bold(`  Today's Focus: `) + chalk.green(suggestion));
-      console.log(chalk.dim('  ' + yLine + ' → ' + rationale));
+      console.log(chalk.bold.cyan('\n🎯 Muscle Readiness\n'));
+      if (recovery.score !== null) {
+        console.log(chalk.dim(`  WHOOP Recovery: ${recovery.score}%\n`));
+      }
+      for (const { muscle, score } of sorted) {
+        const pad = muscle.padEnd(11);
+        const color = score >= 80 ? chalk.green : score >= 50 ? chalk.yellow : chalk.red;
+        console.log(`  ${indicator(score)} ${pad} ${bar(score)} ${color(score + '%')}`);
+      }
+      if (distribution) {
+        console.log(chalk.dim(`\n  Strength: ${distribution.overallScore} (${distribution.percentile}th percentile among Tonal users)`));
+      }
       console.log();
     }
   });
