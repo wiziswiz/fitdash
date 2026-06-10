@@ -62,6 +62,12 @@ import {
   capitalize,
 } from './lib/format.js';
 
+// Network layer (only loaded/used by online commands: sync, workout)
+import { runSync } from './lib/sync.js';
+import { connect, getMovements, indexMovements, listWorkouts, createWorkout, deleteWorkout } from './lib/tonal-api.js';
+import { buildPayload, specFromSuggestion } from './lib/workout-spec.js';
+import { readFileSync } from 'fs';
+
 const program = new Command();
 
 program
@@ -656,6 +662,163 @@ program
     }
 
     console.log('');
+  });
+
+// ─── fitdash sync (ONLINE — requires login) ──────────────────────────────────
+
+program
+  .command('sync')
+  .description('🔌 Log in to Tonal and download all data to local files (requires credentials)')
+  .action(async () => {
+    try {
+      console.log(chalk.dim('Logging in to Tonal…'));
+      const summary = await runSync();
+      console.log(chalk.bold.green('\n✓ Sync complete\n'));
+      console.log(`  Workouts:        ${summary.workouts}`);
+      console.log(`  Movement library:${String(summary.movements).padStart(2)} exercises`);
+      console.log(`  Strength points: ${summary.strengthPoints}`);
+      console.log(`  Muscle readiness:${summary.readiness ? ' ✓' : ' —'}`);
+      console.log(`  Distribution:    ${summary.distribution ? ' ✓' : ' —'}`);
+      if (summary.latest.date) {
+        console.log(chalk.dim(`\n  Latest: ${summary.latest.title} on ${summary.latest.date} — ${commaNum(summary.latest.volume)} lbs`));
+      }
+      console.log(chalk.dim('\n  Now run `fitdash today` / `fitdash strength` (offline) to view it.\n'));
+    } catch (err) {
+      console.error(chalk.red(`\nSync failed: ${err.message}\n`));
+      process.exit(1);
+    }
+  });
+
+// ─── fitdash workout (ONLINE — requires login) ───────────────────────────────
+
+const workout = program
+  .command('workout')
+  .description('🔌 Create / list / delete custom workouts on Tonal (requires credentials)');
+
+workout
+  .command('list')
+  .description('List your custom workouts')
+  .action(async () => {
+    try {
+      const { token } = await connect();
+      const ws = await listWorkouts(token);
+      console.log(chalk.bold.cyan(`\n🏋️  Custom Workouts (${ws.length})\n`));
+      if (!ws.length) {
+        console.log(chalk.dim('  None yet. Create one with `fitdash workout create <spec.json>`.'));
+      }
+      for (const w of ws) {
+        console.log(`  ${chalk.green('●')} ${chalk.bold((w.title || 'untitled').padEnd(28))} ${chalk.dim('id=' + w.id)}  ${chalk.dim(w.publishState || '')}`);
+      }
+      console.log(chalk.dim('\n  (list view shows sets:0 in summary — that is normal, not a bug)\n'));
+    } catch (err) {
+      console.error(chalk.red(`\nList failed: ${err.message}\n`));
+      process.exit(1);
+    }
+  });
+
+workout
+  .command('movements')
+  .description('Search the Tonal exercise library (by name)')
+  .option('--search <term>', 'Filter by name substring')
+  .action(async (opts) => {
+    try {
+      const { token } = await connect();
+      let mv = await getMovements(token);
+      const term = (opts.search || '').toLowerCase();
+      if (term) mv = mv.filter((m) => (m.name || '').toLowerCase().includes(term));
+      mv.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+      console.log(chalk.bold.cyan(`\n📚 Exercise Library (${mv.length}${term ? ` matching "${opts.search}"` : ''})\n`));
+      for (const m of mv.slice(0, 80)) {
+        const measure = m.countReps === false ? chalk.yellow('timed') : m.countReps === true ? chalk.green('reps') : chalk.dim('?');
+        const machine = m.onMachine === false ? chalk.dim('off-machine') : '';
+        console.log(`  ${chalk.bold((m.name || '').padEnd(26))} ${measure.padEnd(15)} ${machine}  ${chalk.dim(m.muscleGroups?.join(', ') || '')}`);
+      }
+      if (mv.length > 80) console.log(chalk.dim(`\n  …${mv.length - 80} more. Narrow with --search.`));
+      console.log('');
+    } catch (err) {
+      console.error(chalk.red(`\nMovements failed: ${err.message}\n`));
+      process.exit(1);
+    }
+  });
+
+workout
+  .command('create [specFile]')
+  .description('Create a custom workout from a spec JSON, or use --from-suggest')
+  .option('--from-suggest', 'Build the workout that `fitdash suggest` recommends today')
+  .option('--rounds <n>', 'Circuit rounds when using --from-suggest', '3')
+  .option('--dry-run', 'Show the payload without sending it')
+  .action(async (specFile, opts) => {
+    try {
+      const { token } = await connect();
+      const movements = await getMovements(token);
+      const byName = indexMovements(movements);
+
+      let spec;
+      if (opts.fromSuggest) {
+        // Reuse the offline suggest logic to pick a focus, then template it.
+        const whoopSummary = loadWhoopSummary();
+        const recovery = whoopSummary ? getRecoveryInfo(whoopSummary) : { score: null };
+        const readiness = loadMuscleReadiness();
+        const rs = suggestFromReadiness(readiness, recovery.score);
+        let focus;
+        if (rs) {
+          focus = rs.suggestion;
+        } else {
+          const tonalData = loadTonalWorkouts();
+          const movementsMap = loadMovementsCache();
+          focus = suggestTodayFocus(tonalData, movementsMap, recovery.score).suggestion;
+        }
+        spec = specFromSuggestion(focus, byName, { rounds: parseInt(opts.rounds, 10) || 3 });
+        if (!spec) {
+          console.error(chalk.red(`\nNo workout template for focus "${focus}". Build a spec file instead.\n`));
+          process.exit(1);
+        }
+        console.log(chalk.dim(`Focus from suggest: ${chalk.bold(focus)}`));
+      } else if (specFile) {
+        spec = JSON.parse(readFileSync(specFile, 'utf8'));
+      } else {
+        console.error(chalk.red('\nProvide a <specFile> or use --from-suggest.\n'));
+        process.exit(1);
+      }
+
+      const { payload, warnings } = buildPayload(spec, byName);
+      for (const w of warnings) console.log(chalk.yellow(`  ⚠  ${w}`));
+
+      console.log(chalk.bold.cyan(`\n🏗️  ${payload.title}`));
+      console.log(chalk.dim(`  ${payload.sets.length} sets across ${spec.exercises.length} exercises\n`));
+
+      if (opts.dryRun) {
+        console.log(JSON.stringify(payload, null, 2));
+        console.log(chalk.dim('\n  --dry-run: nothing sent.\n'));
+        return;
+      }
+
+      const created = await createWorkout(token, payload);
+      console.log(chalk.green(`✓ Tonal accepted it (id=${created.id || '?'})`));
+      console.log(
+        chalk.yellow(
+          '\n  ⚠  API accepted ≠ instantly visible. Pull-to-refresh (or force-quit) the\n' +
+            '     Tonal app, and it should appear. The device usually shows it right away.\n'
+        )
+      );
+    } catch (err) {
+      console.error(chalk.red(`\nCreate failed: ${err.message}\n`));
+      process.exit(1);
+    }
+  });
+
+workout
+  .command('delete <id>')
+  .description('Delete a custom workout by id')
+  .action(async (id) => {
+    try {
+      const { token } = await connect();
+      await deleteWorkout(token, id);
+      console.log(chalk.green(`\n✓ Deleted workout ${id}\n`));
+    } catch (err) {
+      console.error(chalk.red(`\nDelete failed: ${err.message}\n`));
+      process.exit(1);
+    }
   });
 
 program.parse(process.argv);
