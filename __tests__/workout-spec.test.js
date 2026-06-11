@@ -135,7 +135,7 @@ describe('specFromSuggestion', () => {
   });
 
   it('skips template exercises not present in the library', () => {
-    // Chest template references moves not in our fake lib → null (no matches)
-    expect(specFromSuggestion('Chest & Shoulders', byName)).toBe(null);
+    // Our fake lib only has core moves; Back & Biceps template names are absent → null.
+    expect(specFromSuggestion('Back & Biceps', byName)).toBe(null);
   });
 });
